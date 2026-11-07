@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+*.err
+config.json
+models/
+nul
+bot.log
+bot.err
+hermes.log

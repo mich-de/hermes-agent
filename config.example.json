@@ -1,0 +1,31 @@
+{
+  "telegram_token": "YOUR_BOT_TOKEN",
+  "allowed_chat_ids": [123456789],
+  "opencode_bin": "opencode",
+  "opencode_env": {
+    "XDG_CONFIG_HOME": "",
+    "XDG_DATA_HOME": "",
+    "XDG_CACHE_HOME": "",
+    "XDG_STATE_HOME": "",
+    "OPENCODE_DISABLE_AUTOUPDATE": "1"
+  },
+  "models": [
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/mimo-v2.6-flash-free",
+    "opencode/nemotron-3.5-super-vl-free",
+    "opencode/nemotron-3.5-lightning-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/beam-free",
+    "opencode/flint-40b-free"
+  ],
+  "fritz_reconnect_bin": "",
+  "fritz_cooldown_minutes": 30,
+  "quota_tokens": 150000,
+  "response_timeout_seconds": 300,
+  "stt_model_dir": "models/sherpa-onnx-whisper-base",
+  "stt_language": "it",
+  "working_dir": ".",
+  "kitt_voice_enabled": false,
+  "kitt_python": "",
+  "kitt_tts_script": ""
+}

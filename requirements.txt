@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0
+sherpa-onnx>=2.0.1
+numpy>=2.0
+pypdf>=5.0
+
