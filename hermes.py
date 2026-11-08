@@ -2,6 +2,8 @@
 
 import asyncio
 import contextlib
+import functools
+import html
 import json
 import logging
 import os
@@ -10,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -54,6 +57,23 @@ model_failures: dict[str, float] = {}
 fritz_last_run: float = 0
 # Token tracking per sessione: {session_id: {"total_in": N, "total_out": N, "turns": N, "model": str}}
 session_tokens: dict[str, dict] = {}
+TOKENS_PATH = Path(__file__).parent / ".tokens.json"
+
+
+def _load_tokens():
+    global session_tokens
+    if TOKENS_PATH.exists():
+        try:
+            session_tokens = json.loads(TOKENS_PATH.read_text("utf-8"))
+        except (json.JSONDecodeError, ValueError):
+            session_tokens = {}
+
+
+def _save_tokens():
+    try:
+        TOKENS_PATH.write_text(json.dumps(session_tokens, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("Salvataggio token fallito: %s", e)
 
 
 def load_config():
@@ -61,6 +81,7 @@ def load_config():
     cfg = json.loads(CFG_PATH.read_text("utf-8"))
     SYSTEM_PREFIX = _load_system_prefix()
     KITT_PREFIX = _load_kitt_prefix()
+    _load_tokens()
     if not cfg["telegram_token"]:
         sys.exit("Compila telegram_token in config.json")
     if not cfg["allowed_chat_ids"]:
@@ -121,7 +142,7 @@ def _get_session_key(chat_id: int, chat_data: dict) -> str:
 
 
 def _update_token_stats(session_id: str, token_info: dict, model: str):
-    """Aggiorna le statistiche token per la sessione."""
+    """Aggiorna le statistiche token per la sessione e salva su disco."""
     if not token_info:
         return
     stats = session_tokens.setdefault(session_id, {"total_in": 0, "total_out": 0, "turns": 0, "model": model})
@@ -129,6 +150,7 @@ def _update_token_stats(session_id: str, token_info: dict, model: str):
     stats["total_out"] += token_info.get("output", 0)
     stats["turns"] += 1
     stats["model"] = model
+    _save_tokens()
 
 
 def _check_session_health(session_id: str) -> tuple[str | None, bool]:
@@ -425,6 +447,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Reset sessione: la prossima conversazione parte da zero."""
     old_key = _get_session_key(update.message.chat_id, ctx.chat_data)
     stats = session_tokens.pop(old_key, None)
+    _save_tokens()
     new_key = f"hermes-{update.message.chat_id}-{int(time.time())}"
     ctx.chat_data["session_key"] = new_key
     ctx.chat_data["force_new"] = True
@@ -440,6 +463,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def _reset_session(chat_id: int, chat_data: dict) -> dict | None:
     old_key = _get_session_key(chat_id, chat_data)
     stats = session_tokens.pop(old_key, None)
+    _save_tokens()
     chat_data["session_key"] = f"hermes-{chat_id}-{int(time.time())}"
     chat_data["force_new"] = True
     chat_data.pop("model_locked", None)
@@ -495,6 +519,56 @@ async def cmd_tokens(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_models(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     names = [m.split("/")[-1] for m in cfg["models"]]
     await update.message.reply_text("Modelli:\n" + "\n".join(f"  {i+1}. {n}" for i, n in enumerate(names)))
+
+
+async def cmd_quota(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Mostra statistiche uso Open Code + tracking locale."""
+    await update.message.reply_text("📊 Recupero statistiche...")
+    env = {**os.environ, **cfg["opencode_env"]}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cfg["opencode_bin"], "stats",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        stats_text = stdout.decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        stats_text = f"(opencode stats non disponibile: {e})"
+
+    # Tracking locale
+    sk = _get_session_key(update.message.chat_id, ctx.chat_data)
+    local_stats = session_tokens.get(sk)
+    quota = int(cfg.get("quota_tokens") or 150_000)
+
+    lines = ["<b>📊 Quota &amp; Statistiche</b>\n"]
+    if local_stats:
+        total = local_stats["total_in"] + local_stats["total_out"]
+        pct = total / quota * 100
+        bar_full = int(pct / 5)
+        bar = "█" * min(bar_full, 20) + "░" * max(0, 20 - bar_full)
+        lines.append(f"<b>Sessione locale</b>")
+        lines.append(f"Token: {total:,} / {quota:,} ({pct:.0f}%)")
+        lines.append(f"<code>[{bar}]</code>")
+        lines.append(f"Turni: {local_stats['turns']} · Modello: {local_stats['model'].split('/')[-1]}")
+        warning, _ = _check_session_health(sk)
+        if warning:
+            lines.append(warning)
+    else:
+        lines.append("Sessione locale: nessun dato (manda un messaggio prima)")
+
+    # Totale storico da tutte le sessioni salvate
+    all_total = sum(s.get("total_in", 0) + s.get("total_out", 0) for s in session_tokens.values())
+    all_turns = sum(s.get("turns", 0) for s in session_tokens.values())
+    if all_total:
+        lines.append(f"\n<b>Totale storico hermes</b>: {all_total:,} token, {all_turns} turni")
+
+    lines.append(f"\n<b>Open Code stats</b>")
+    # Rimuovi escape ANSI e art
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", stats_text)
+    lines.append(f"<pre>{clean[:2000]}</pre>")
+
+    text = "\n".join(lines)
+    await update.message.reply_text(text[:TG_LIMIT], parse_mode="HTML")
 
 
 # --- Comandi utensile ---
@@ -709,22 +783,24 @@ def _kill_orphan_opencode() -> list[int]:
 
 
 def _spawn_hermes_detached(delay: int = 3):
-    """Rilancia il bot tra `delay` secondi in un processo staccato: sopravvive a questo."""
+    """Rilancia il bot tra `delay` secondi in un processo staccato: sopravvive a os._exit."""
     script = str(Path(__file__).resolve())
-    flags = 0
-    if os.name == "nt":
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
-    cmd = f'timeout /t {delay} /nobreak >nul & "{sys.executable}" "{script}"'
+    exe = sys.executable
+    if exe.endswith("python.exe"):
+        exe = exe.replace("python.exe", "pythonw.exe")
+    bat = Path(__file__).parent / "_relaunch.cmd"
+    bat.write_text(
+        f'@echo off\nping -n {delay + 1} 127.0.0.1 >nul\nstart "" "{exe}" "{script}"\ndel "%~f0"\n',
+        encoding="utf-8",
+    )
     try:
         subprocess.Popen(
-            ["cmd.exe", "/c", cmd],
+            f'cmd.exe /c start /min "" "{bat}"',
             cwd=str(Path(script).parent),
-            creationflags=flags,
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
             close_fds=True,
         )
-        log.info("Rilancio programmato tra %ds", delay)
+        log.info("Rilancio programmato tra %ds via _relaunch.cmd", delay)
     except Exception as exc:
         log.error("Rilancio fallito: %s", exc)
 
@@ -736,9 +812,12 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     killed = _kill_other_hermes()
     _spawn_hermes_detached(delay=3)
     detail = f" (chiusi {len(killed)} duplicati)" if killed else ""
-    await update.message.reply_text(f"Riavvio in corso{detail}... online tra ~10s.")
+    await update.message.reply_text(f"🔄 Riavvio in corso{detail}... online tra ~10s.")
+    # Flag per notifica post-restart
+    flag = Path(__file__).parent / ".restart_chat"
+    flag.write_text(str(update.message.chat_id), encoding="utf-8")
     log.info("Restart richiesto da chat %s — duplicati chiusi: %s", update.message.chat_id, killed)
-    await asyncio.sleep(1)  # lascia spedire la reply
+    await asyncio.sleep(1)
     os._exit(0)
 
 
@@ -817,25 +896,109 @@ def _bar(done: bool, running: bool) -> str:
     return "░░░░░░░░ ⏳"
 
 
-def _render_dashboard(task: str, agents: list[dict], elapsed: float, synthesis: str | None = None) -> str:
+DISPATCH_PROMPT = (
+    "Sei un dispatcher. Dividi il task in 2-4 sottotask indipendenti, eseguibili in parallelo da agenti diversi. "
+    "Non risolvere il task. Rispondi SOLO con un array JSON, senza testo prima o dopo:\n"
+    '[{"titolo": "max 5 parole", "istruzioni": "cosa deve fare e produrre l\'agente"}]\n\nTASK: '
+)
+MAX_SUBTASKS = 4
+MAX_ATTEMPTS = 3
+WORKER_FAIL = ("Timeout:", "Errore lancio")
+SNAPSHOT_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", "models"}
+
+
+def _parse_subtasks(text: str) -> list[dict]:
+    """Estrae i sottotask dal JSON del dispatcher; [] se non valido."""
+    start, end = text.find("["), text.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    try:
+        items = json.loads(text[start:end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(items, list):
+        return []
+    subtasks = []
+    for it in items:
+        if isinstance(it, dict) and str(it.get("istruzioni", "")).strip():
+            subtasks.append({
+                "title": str(it.get("titolo") or f"sottotask {len(subtasks) + 1}").strip()[:40],
+                "instructions": str(it["istruzioni"]).strip(),
+            })
+    return subtasks[:MAX_SUBTASKS]
+
+
+def _parse_verdict(text: str, n: int) -> dict[int, str]:
+    """Righe 'KO <n>: motivo' -> {n: motivo}. Vuoto = tutto OK, anche se la risposta è illeggibile."""
+    bad = {}
+    for m in re.finditer(r"^\W*KO\s*#?(\d+)\s*[:\-–]\s*(.+)$", text, re.MULTILINE | re.IGNORECASE):
+        idx = int(m.group(1))
+        if 1 <= idx <= n:
+            bad[idx] = m.group(2).strip()
+    return bad
+
+
+def _snapshot(root: str) -> dict[str, float]:
+    snap: dict[str, float] = {}
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SNAPSHOT_SKIP]
+        for f in files:
+            if f.startswith(".") or f.endswith(".log"):
+                continue
+            p = os.path.join(dirpath, f)
+            with contextlib.suppress(OSError):
+                snap[p] = os.path.getmtime(p)
+        if len(snap) > 20000:  # shortcut: working_dir enormi vengono campionati, alzare se serve
+            break
+    return snap
+
+
+def _changed_files(before: dict[str, float], after: dict[str, float]) -> list[str]:
+    return sorted(p for p, mt in after.items() if before.get(p) != mt)
+
+
+async def _run_with_retry(prompt: str, models: list[str], offset: int = 0) -> tuple[str, str, int, bool]:
+    """Prova fino a MAX_ATTEMPTS modelli partendo da offset. Ritorna (risposta, modello, tentativi, ok)."""
+    resp, model, attempts = "Nessun modello disponibile.", "", 0
+    for i in range(len(models)):
+        model = models[(offset + i) % len(models)]
+        if time.time() - model_failures.get(model, 0) <= 600:
+            continue
+        attempts += 1
+        resp, limited, _ = await run_opencode(prompt, model, continue_session=False)
+        if limited:
+            model_failures[model] = time.time()
+            resp = f"(rate limit su {model})"
+        elif resp.strip() and resp != "(nessuna risposta)" and not resp.startswith(WORKER_FAIL):
+            return resp, model, attempts, True
+        log.info("Tentativo %d fallito su %s", attempts, model)
+        if attempts >= MAX_ATTEMPTS:
+            break
+    return resp, model, attempts, False
+
+
+def _stage(icon: str, name: str, state: str, note: str = "") -> str:
+    return f"{icon} <b>{name}</b>  {_bar(state == 'done', state == 'running')}{note}"
+
+
+def _render_dashboard(task: str, agents: list[dict], elapsed: float, stages: dict) -> str:
     """Genera il testo della dashboard live."""
-    t = task[:80] + ("..." if len(task) > 80 else "")
-    lines = [f"🤖 <b>TEAM</b> — {t}", ""]
+    t = html.escape(task[:80] + ("..." if len(task) > 80 else ""))
+    lines = [f"🤖 <b>TEAM</b> — {t}", "", _stage("📋", "DISPATCHER", stages.get("dispatch", "")), ""]
     for i, a in enumerate(agents):
         prefix = "┌" if i == 0 else ("└" if i == len(agents) - 1 else "├")
         model_short = a["model"].split("/")[-1][:20] if a["model"] else "—"
-        bar = _bar(a["done"], a["running"])
+        bar = "▓▓▓▓▓▓▓▓ ❌" if a["failed"] else _bar(a["done"], a["running"])
+        retry = f" ↻{a['attempts']}" if a["attempts"] > 1 else ""
         elapsed_a = f" {a['elapsed']:.0f}s" if a["done"] else ""
-        lines.append(f"{prefix} {a['icon']} <b>{a['role'].upper()}</b>  {bar}  <code>{model_short}</code>{elapsed_a}")
+        title = html.escape(f"#{a['key']} {a['title'][:24]}")
+        lines.append(f"{prefix} 🛠 <b>{title}</b>  {bar}  <code>{model_short}</code>{elapsed_a}{retry}")
 
     lines.append("")
-    if synthesis == "running":
-        lines.append("🧠 <b>SINTESI</b>  ▓▓▓▓░░░░ ⚙️")
-    elif synthesis:
-        lines.append("🧠 <b>SINTESI</b>  ▓▓▓▓▓▓▓▓ ✅")
-    else:
-        lines.append("🧠 <b>SINTESI</b>  ░░░░░░░░ ⏳")
-
+    lines.append(_stage("🧪", "VERIFIER", stages.get("verify", ""), stages.get("verify_note", "")))
+    if "fix" in stages:
+        lines.append(_stage("🔧", "CORREZIONE", stages["fix"]))
+    lines.append(_stage("🧠", "SINTESI", stages.get("synth", "")))
     lines.append(f"\n⏱ {elapsed:.0f}s")
     return "\n".join(lines)
 
@@ -853,106 +1016,119 @@ async def cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🤖 <b>Multi-Agent Team</b>\n\n"
             "Uso: <code>/team descrizione task</code>\n\n"
-            "Lancia 3 agenti in parallelo:\n"
-            "🔍 <b>Analyst</b> — analisi e requisiti\n"
-            "💻 <b>Coder</b> — soluzione tecnica\n"
-            "🔎 <b>Reviewer</b> — revisione critica\n"
+            "📋 <b>Dispatcher</b> — divide il task in 2-4 sottotask\n"
+            "🛠 <b>Worker</b> — uno per sottotask, in parallelo, con retry su altri modelli\n"
+            "🧪 <b>Verifier</b> — controlla output e file modificati, non scrive codice\n"
+            "🔧 <b>Correzione</b> — un giro sui sottotask bocciati\n"
             "🧠 <b>Sintesi</b> — risposta finale integrata",
             parse_mode="HTML",
         )
         return
+    await run_team(task, update.message.chat_id, update.message.reply_text)
 
+
+async def run_team(task: str, chat_id: int, send, context: str = "") -> None:
+    """Dispatcher → worker con retry → verifier → correzione → sintesi.
+    send: coroutine che invia un messaggio (reply_text o bot.send_message legato alla chat)."""
     global _team_counter
     _team_counter += 1
     team_id = f"t{_team_counter}"
-    chat_id = update.message.chat_id
 
-    available = [m for m in cfg["models"] if time.time() - model_failures.get(m, 0) > 600]
-    if not available:
-        await update.message.reply_text("Nessun modello disponibile.")
+    models = [m for m in cfg["models"] if time.time() - model_failures.get(m, 0) > 600]
+    if not models:
+        await send("Nessun modello disponibile.")
         return
 
-    agents = []
-    for i, (role, icon, _system) in enumerate(AGENT_ROLES):
-        agents.append({
-            "role": role, "icon": icon,
-            "model": available[i % len(available)],
-            "done": False, "running": False, "elapsed": 0.0, "result": "",
-        })
-
+    stages: dict = {"dispatch": "running"}
+    agents: list[dict] = []
     t0 = time.time()
-    dashboard = await update.message.reply_text(
-        _render_dashboard(task, agents, 0),
-        parse_mode="HTML",
-    )
+    dashboard = await send(_render_dashboard(task, agents, 0, stages), parse_mode="HTML")
 
-    async def _update_dash(synthesis=None):
-        try:
-            await dashboard.edit_text(
-                _render_dashboard(task, agents, time.time() - t0, synthesis),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+    async def dash():
+        with contextlib.suppress(Exception):
+            await dashboard.edit_text(_render_dashboard(task, agents, time.time() - t0, stages), parse_mode="HTML")
 
-    async def _run_agent(idx: int):
-        role, _icon, system = AGENT_ROLES[idx]
-        agents[idx]["running"] = True
-        await _update_dash()
+    raw, _, _, ok = await _run_with_retry(context + DISPATCH_PROMPT + task, models)
+    subtasks = _parse_subtasks(raw) if ok else []
+    if not subtasks:
+        log.info("Dispatcher non valido, uso i ruoli fissi")
+        subtasks = [{"title": role, "instructions": system} for role, _icon, system in AGENT_ROLES]
+    stages["dispatch"] = "done"
+    for i, st in enumerate(subtasks, 1):
+        agents.append({
+            "key": str(i), "title": st["title"], "instructions": st["instructions"],
+            "model": models[(i - 1) % len(models)], "done": False, "running": False,
+            "failed": False, "elapsed": 0.0, "attempts": 0, "result": "",
+        })
+    await dash()
+
+    def worker_prompt(a: dict, fix: str) -> str:
+        p = (f"{context}Sei l'agente #{a['key']} di un team. Esegui SOLO il tuo sottotask, in italiano, conciso.\n"
+             f"TASK GENERALE: {task}\n\nSOTTOTASK #{a['key']} — {a['title']}:\n{a['instructions']}")
+        if fix:
+            p += (f"\n\nIl verificatore ha bocciato il tuo output precedente: {fix}\n"
+                  f"OUTPUT PRECEDENTE:\n{a['result'][:3000]}\n\nCorreggilo.")
+        return p
+
+    async def run_worker(i: int, fix: str = ""):
+        a = agents[i]
+        a.update(running=True, done=False, failed=False)
+        await dash()
         at0 = time.time()
-        prompt = f"[RUOLO: {role.upper()}]\n{system}\n\nTASK: {task}"
-        resp, limited, _ = await run_opencode(prompt, agents[idx]["model"], continue_session=False)
-        agents[idx]["elapsed"] = time.time() - at0
-        agents[idx]["done"] = True
-        agents[idx]["running"] = False
-        if limited:
-            model_failures[agents[idx]["model"]] = time.time()
-            agents[idx]["result"] = f"(rate limit su {agents[idx]['model']})"
-        else:
-            agents[idx]["result"] = resp
-        await _update_dash()
+        resp, model, attempts, w_ok = await _run_with_retry(worker_prompt(a, fix), models, i)
+        a.update(result=resp, model=model or a["model"], attempts=a["attempts"] + attempts,
+                 elapsed=a["elapsed"] + time.time() - at0, running=False, done=True, failed=not w_ok)
+        await dash()
 
-    await asyncio.gather(*[_run_agent(i) for i in range(len(AGENT_ROLES))])
+    before = await asyncio.to_thread(_snapshot, cfg["working_dir"])
+    await asyncio.gather(*(run_worker(i) for i in range(len(agents))))
 
-    # Sintesi
-    await _update_dash(synthesis="running")
-    synthesis_prompt = (
-        "Sei un coordinatore. Sintetizza le risposte di 3 agenti specializzati.\n"
-        f"Task: {task}\n\n"
-    )
+    stages["verify"] = "running"
+    await dash()
+    after = await asyncio.to_thread(_snapshot, cfg["working_dir"])
+    changed = _changed_files(before, after)
+    verify_prompt = ("Sei il verificatore di un team. NON scrivere codice e NON modificare file: puoi solo leggerli.\n"
+                     f"TASK: {task}\n\n")
     for a in agents:
-        synthesis_prompt += f"--- {a['role'].upper()} ---\n{a['result']}\n\n"
-    synthesis_prompt += (
-        "Rispondi in italiano con una risposta finale integrata. "
-        "Incorpora i punti migliori, correggi errori del reviewer. Max 500 parole."
-    )
+        verify_prompt += (f"--- SOTTOTASK #{a['key']} {a['title']} ---\nIstruzioni: {a['instructions']}\n"
+                          f"Output:\n{a['result'][:2500]}\n\n")
+    verify_prompt += ("File creati o modificati dagli agenti:\n" + ("\n".join(changed[:30]) or "(nessuno)") +
+                      "\n\nControlla che ogni output soddisfi le istruzioni e che i file citati esistano e siano coerenti. "
+                      "Per ogni sottotask bocciato scrivi una riga nel formato 'KO <numero>: motivo'. "
+                      "Se va tutto bene rispondi solo 'OK'.")
+    verdict, _, _, v_ok = await _run_with_retry(verify_prompt, models)
+    bad = _parse_verdict(verdict, len(agents)) if v_ok else {}
+    stages["verify"] = "done"
+    stages["verify_note"] = ("  KO " + " ".join(f"#{k}" for k in bad)) if bad else ("  OK" if v_ok else "  saltato")
 
-    synth_model = available[0]
-    synth_resp, limited, _ = await run_opencode(synthesis_prompt, synth_model, continue_session=False)
-    if limited:
-        synth_resp = "\n\n".join(f"<b>{a['role'].upper()}</b>:\n{a['result']}" for a in agents)
+    if bad:
+        stages["fix"] = "running"
+        await asyncio.gather(*(run_worker(k - 1, reason) for k, reason in bad.items()))
+        stages["fix"] = "done"
 
-    await _update_dash(synthesis="done")
+    stages["synth"] = "running"
+    await dash()
+    synthesis_prompt = (f"Sei un coordinatore. Sintetizza i risultati di {len(agents)} agenti che hanno lavorato "
+                        f"su sottotask diversi.\nTask: {task}\n\n")
+    for a in agents:
+        synthesis_prompt += f"--- #{a['key']} {a['title']} ---\n{a['result']}\n\n"
+    synthesis_prompt += "Rispondi in italiano con una risposta finale integrata. Max 500 parole."
+    synth_resp, _, _, s_ok = await _run_with_retry(synthesis_prompt, models)
+    if not s_ok:
+        synth_resp = "\n\n".join(f"<b>#{a['key']} {html.escape(a['title'])}</b>:\n{a['result']}" for a in agents)
+    stages["synth"] = "done"
+    await dash()
 
-    # Salva risultati per callback inline
     _team_results.setdefault(chat_id, {})[team_id] = {
         "task": task,
-        "agents": {a["role"]: {"text": a["result"], "model": a["model"], "time": a["elapsed"]} for a in agents},
+        "agents": {a["key"]: {"title": a["title"], "text": a["result"], "model": a["model"], "time": a["elapsed"]}
+                   for a in agents},
         "synthesis": synth_resp,
     }
-
-    # Inline keyboard per espandere risultati singoli agenti
-    buttons = []
-    for a in agents:
-        buttons.append(InlineKeyboardButton(f"{a['icon']} {a['role'].upper()}", callback_data=f"team:{team_id}:{a['role']}"))
-    keyboard = InlineKeyboardMarkup([buttons])
-
-    clean_synth = synth_resp[:TG_LIMIT - 200]
-    await update.message.reply_text(
-        f"🧠 <b>Sintesi finale</b>\n\n{clean_synth}",
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
+    buttons = [InlineKeyboardButton(f"🛠 #{a['key']} {a['title'][:18]}", callback_data=f"team:{team_id}:{a['key']}")
+               for a in agents]
+    keyboard = InlineKeyboardMarkup([buttons[:2], buttons[2:]] if len(buttons) > 2 else [buttons])
+    await send(f"🧠 <b>Sintesi finale</b>\n\n{synth_resp[:TG_LIMIT - 200]}", parse_mode="HTML", reply_markup=keyboard)
 
 
 async def on_team_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -976,11 +1152,123 @@ async def on_team_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not agent_data:
         return
 
-    icon = {"analyst": "🔍", "coder": "💻", "reviewer": "🔎"}.get(role, "🤖")
     model_short = agent_data["model"].split("/")[-1]
-    header = f"{icon} <b>{role.upper()}</b>  ·  <code>{model_short}</code>  ·  {agent_data['time']:.0f}s\n\n"
+    title = html.escape(f"#{role} {agent_data.get('title', '')}")
+    header = f"🛠 <b>{title}</b>  ·  <code>{model_short}</code>  ·  {agent_data['time']:.0f}s\n\n"
     text = header + agent_data["text"][:TG_LIMIT - len(header)]
     await query.message.reply_text(text, parse_mode="HTML")
+
+
+VAULT_DIR = Path(__file__).parent / "vault"
+SCHEDULES_PATH = Path(__file__).parent / ".schedules.json"
+SCHED_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)\s+(.+)$", re.DOTALL)
+SCHEDULE_USAGE = (
+    "⏰ Pianificazioni giornaliere\n\n"
+    "/schedule HH:MM <prompt>       → prompt ogni giorno\n"
+    "/schedule HH:MM /team <task>   → team ogni giorno\n"
+    "/schedule list                 → elenco\n"
+    "/schedule del N                → rimuove la N\n\n"
+    "Ogni esecuzione riceve le 5 note più recenti del vault Obsidian."
+)
+
+
+def _load_schedules() -> list[dict]:
+    try:
+        return json.loads(SCHEDULES_PATH.read_text("utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return []
+
+
+def _save_schedules(items: list[dict]):
+    SCHEDULES_PATH.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _vault_dir() -> Path:
+    return Path(cfg.get("vault_dir") or VAULT_DIR)
+
+
+def _vault_context(limit: int = 5, max_chars: int = 2000) -> str:
+    vault = _vault_dir()
+    if not vault.is_dir():
+        return ""
+    notes = sorted(vault.rglob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+    if not notes:
+        return ""
+    parts = [f"### {p.relative_to(vault)}\n{p.read_text('utf-8', errors='replace')[:max_chars]}" for p in notes]
+    return "[NOTE RECENTI DAL VAULT OBSIDIAN]\n" + "\n\n".join(parts) + "\n\n"
+
+
+def _due(item: dict, now: datetime) -> bool:
+    return now.strftime("%H:%M") >= item["time"] and item.get("last") != now.strftime("%Y-%m-%d")
+
+
+async def _run_scheduled(app: Application, item: dict):
+    chat_id = item["chat_id"]
+    send = functools.partial(app.bot.send_message, chat_id)
+    prompt = item["prompt"]
+    try:
+        await send(f"⏰ {item['time']} — {prompt[:100]}")
+        context = await asyncio.to_thread(_vault_context)
+        if prompt.startswith("/team "):
+            await run_team(prompt[6:].strip(), chat_id, send, context)
+            return
+        resp, _, _ = await handle_prompt(context + prompt, chat_id, {"force_new": True, "booted": True})
+        for i in range(0, len(resp), TG_LIMIT):
+            await send(resp[i:i + TG_LIMIT])
+    except Exception as e:
+        log.exception("Pianificazione fallita: %s", prompt[:60])
+        with contextlib.suppress(Exception):
+            await send(f"⏰ Pianificazione fallita: {e}")
+
+
+async def _scheduler_loop(app: Application):
+    while True:
+        await asyncio.sleep(30)
+        try:
+            now = datetime.now()
+            items = _load_schedules()
+            due = [it for it in items if _due(it, now)]
+            if not due:
+                continue
+            for it in due:
+                it["last"] = now.strftime("%Y-%m-%d")
+            _save_schedules(items)  # prima di eseguire: un crash non ripete il job
+            for it in due:
+                asyncio.create_task(_run_scheduled(app, it))
+        except Exception:
+            log.exception("Scheduler loop")
+
+
+async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = " ".join(ctx.args).strip() if ctx.args else ""
+    items = _load_schedules()
+    if not args or args == "list":
+        listing = "\n".join(f"{i}. {it['time']} — {it['prompt'][:70]}" for i, it in enumerate(items, 1))
+        await update.message.reply_text((listing or "Nessuna pianificazione.") + "\n\n" + SCHEDULE_USAGE)
+        return
+    if args.startswith("del "):
+        try:
+            removed = items.pop(int(args[4:]) - 1)
+        except (ValueError, IndexError):
+            await update.message.reply_text("Numero non valido. Usa /schedule list.")
+            return
+        _save_schedules(items)
+        await update.message.reply_text(f"Rimossa: {removed['time']} — {removed['prompt'][:70]}")
+        return
+    m = SCHED_RE.match(args)
+    if not m:
+        await update.message.reply_text(SCHEDULE_USAGE)
+        return
+    hhmm = f"{int(m.group(1)):02d}:{m.group(2)}"
+    now = datetime.now()
+    prompt = m.group(3).strip()
+    items.append({
+        "time": hhmm, "prompt": prompt, "chat_id": update.message.chat_id,
+        # orario già passato oggi: parte da domani
+        "last": now.strftime("%Y-%m-%d") if now.strftime("%H:%M") >= hhmm else "",
+    })
+    _save_schedules(items)
+    await update.message.reply_text(f"⏰ Ogni giorno alle {hhmm}: {prompt[:100]}\nVault: {_vault_dir()}")
 
 
 COMMANDS = [
@@ -999,6 +1287,8 @@ COMMANDS = [
     ("run", "esegui comando shell: /run <comando>"),
     ("search", "ricerca web: /search <domanda>"),
     ("team", "multi-agent: /team <task>"),
+    ("schedule", "pianifica: /schedule HH:MM <prompt>"),
+    ("quota", "statistiche uso e quota token"),
 ]
 
 
@@ -1307,6 +1597,26 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await app.bot.set_my_commands([BotCommand(c, d[:256]) for c, d in COMMANDS])
     log.info("Comandi Telegram registrati: %d", len(COMMANDS))
+    _vault_dir().mkdir(parents=True, exist_ok=True)
+    app.bot_data["scheduler"] = asyncio.create_task(_scheduler_loop(app))
+    # Notifica post-restart
+    flag = Path(__file__).parent / ".restart_chat"
+    if flag.exists():
+        try:
+            chat_id = int(flag.read_text("utf-8").strip())
+            n_models = len([m for m in cfg["models"] if time.time() - model_failures.get(m, 0) > 600])
+            await app.bot.send_message(
+                chat_id,
+                f"✅ <b>Hermes Agent online</b>\n\n"
+                f"🤖 Modelli attivi: {n_models}/{len(cfg['models'])}\n"
+                f"🎙️ KITT voice: {'on' if cfg.get('kitt_voice_enabled') else 'off'}\n"
+                f"📡 Comandi: {len(COMMANDS)}",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            log.warning("Notifica post-restart fallita: %s", e)
+        finally:
+            flag.unlink(missing_ok=True)
 
 
 def main():
@@ -1337,6 +1647,8 @@ def main():
         "read": cmd_read, "run": cmd_run, "search": cmd_search,
         "restart": cmd_restart,
         "team": cmd_team,
+        "schedule": cmd_schedule,
+        "quota": cmd_quota,
     }
     for name, fn in handlers.items():
         app.add_handler(CommandHandler(name, fn, filters=auth))

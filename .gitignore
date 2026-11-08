@@ -8,3 +8,8 @@ nul
 bot.log
 bot.err
 hermes.log
+.restart_chat
+.tokens.json
+_relaunch.cmd
+.schedules.json
+vault/

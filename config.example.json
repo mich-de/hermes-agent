@@ -25,6 +25,7 @@
   "stt_model_dir": "models/sherpa-onnx-whisper-base",
   "stt_language": "it",
   "working_dir": ".",
+  "vault_dir": "vault",
   "kitt_voice_enabled": false,
   "kitt_python": "",
   "kitt_tts_script": ""
